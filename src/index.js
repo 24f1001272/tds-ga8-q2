@@ -45,44 +45,83 @@ function utf8Compare(a, b) {
 
 async function handleSelect(data, bodyText, env) {
   const reasonCodes = [];
-  
-  if (!data.runId || typeof data.runId !== 'string' || data.runId.length === 0 || data.runId.length > 128) {
-    return new Response(JSON.stringify({ error: "INVALID_INPUT" }), { status: 400, headers: { 'content-type': 'application/json' } });
-  }
+  let isMalformed = false;
+  const dateRegex = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d{1,3})?(Z|[+-]\d{2}:\d{2})$/;
 
-  const storedStr = await env.STORE.get(data.runId);
-  if (storedStr) {
-    const parsed = JSON.parse(storedStr);
-    if (parsed.request === bodyText) {
-      return new Response(JSON.stringify(parsed.response), { status: 200, headers: { 'content-type': 'application/json' } });
+  // 1. Basic Type & Presence Checks
+  if (!data || typeof data !== 'object') {
+    isMalformed = true;
+  } else {
+    if (!data.runId || typeof data.runId !== 'string' || data.runId.length === 0 || data.runId.length > 128) {
+      isMalformed = true;
+    }
+    if (data.forbiddenFeatures !== undefined && !Array.isArray(data.forbiddenFeatures)) {
+      isMalformed = true;
+    }
+    if (typeof data.numTrialsLimit !== 'number' || !Number.isInteger(data.numTrialsLimit) || data.numTrialsLimit <= 0) {
+      isMalformed = true;
+    }
+
+    if (!Array.isArray(data.rows) || data.rows.length === 0) {
+      isMalformed = true;
     } else {
-      return new Response(JSON.stringify({ error: "RUN_ID_CONFLICT" }), { status: 409, headers: { 'content-type': 'application/json' } });
+      const rowIds = new Set();
+      for (const r of data.rows) {
+        if (!r || typeof r !== 'object' || typeof r.id !== 'string' || typeof r.entity !== 'string' ||
+            !dateRegex.test(r.eventTime) || !dateRegex.test(r.predictionTime) ||
+            typeof r.version !== 'number' || !Number.isSafeInteger(r.version) || r.version < 0 ||
+            (r.split !== 'TRAIN' && r.split !== 'EVAL') ||
+            !r.features || typeof r.features !== 'object') {
+          isMalformed = true;
+          break;
+        } else {
+          if (rowIds.has(r.id)) { isMalformed = true; break; }
+          rowIds.add(r.id);
+          
+          for (const [fname, fval] of Object.entries(r.features)) {
+            if (!fval || typeof fval !== 'object' || typeof fval.value !== 'string' || typeof fval.availableAt !== 'string' || !dateRegex.test(fval.availableAt)) {
+              isMalformed = true;
+              break;
+            }
+          }
+        }
+      }
+    }
+
+    if (!Array.isArray(data.trials)) {
+      isMalformed = true;
+    } else {
+      const trialIds = new Set();
+      for (const t of data.trials) {
+        if (!t || typeof t !== 'object' || typeof t.trialId !== 'number' || !Number.isSafeInteger(t.trialId) || t.trialId < 0) {
+          isMalformed = true;
+          break;
+        } else {
+          if (trialIds.has(t.trialId)) { isMalformed = true; break; }
+          trialIds.add(t.trialId);
+          if (t.status !== 'SUCCEEDED' && t.status !== 'FAILED') { isMalformed = true; break; }
+        }
+      }
     }
   }
 
-  let isMalformed = false;
-  if (!Array.isArray(data.rows) || !Array.isArray(data.trials) || !Number.isInteger(data.numTrialsLimit) || data.numTrialsLimit <= 0) {
-    isMalformed = true;
+  if (isMalformed) {
     reasonCodes.push('INVALID_INPUT');
   }
 
-  let selectedTrialId = null;
-  let datasetDigest = null;
-  let trainRowIds = [];
-  let evalRowIds = [];
-  let featureNames = [];
+  // Check trial limits
+  if (data && Array.isArray(data.trials) && typeof data.numTrialsLimit === 'number' && data.trials.length > data.numTrialsLimit) {
+    reasonCodes.push('TRIAL_LIMIT_EXCEEDED');
+  }
 
-  if (!isMalformed) {
-    if (data.trials.length > data.numTrialsLimit) {
-      reasonCodes.push('TRIAL_LIMIT_EXCEEDED');
-    }
-
-    let bestTrial = null;
-    let hasSuccess = false;
+  // Find best successful trial
+  let bestTrial = null;
+  let hasSuccess = false;
+  if (data && Array.isArray(data.trials)) {
     for (const trial of data.trials) {
-      if (trial.status === 'SUCCEEDED') {
+      if (trial && trial.status === 'SUCCEEDED') {
         hasSuccess = true;
-        if (typeof trial.evalMetric === 'number' && isFinite(trial.evalMetric) && Number.isSafeInteger(trial.trialId) && trial.trialId >= 0) {
+        if (typeof trial.evalMetric === 'number' && isFinite(trial.evalMetric) && typeof trial.trialId === 'number' && Number.isSafeInteger(trial.trialId) && trial.trialId >= 0) {
           if (!bestTrial) {
             bestTrial = trial;
           } else if (trial.evalMetric > bestTrial.evalMetric) {
@@ -95,32 +134,23 @@ async function handleSelect(data, bodyText, env) {
         }
       }
     }
-    
-    if (!hasSuccess) {
-      reasonCodes.push('NO_SUCCESSFUL_TRIAL');
-    }
+  }
 
+  if (!hasSuccess) {
+    reasonCodes.push('NO_SUCCESSFUL_TRIAL');
+  }
+
+  let selectedTrialId = null;
+  let datasetDigest = null;
+  let trainRowIds = [];
+  let evalRowIds = [];
+  let featureNames = [];
+
+  // Deduplicate and process rows only if not malformed
+  if (!reasonCodes.includes('INVALID_INPUT')) {
     const retainedRowsMap = new Map();
-    let rowMalformed = false;
-    
-    const dateRegex = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d{1,3})?(Z|[+-]\d{2}:\d{2})$/;
-
     for (const row of data.rows) {
-      if (!row.id || !row.entity || !row.eventTime || !row.predictionTime || !Number.isSafeInteger(row.version) || row.version < 0 || !['TRAIN', 'EVAL'].includes(row.split) || !row.features) {
-        rowMalformed = true;
-        continue;
-      }
-      if (!dateRegex.test(row.eventTime) || !dateRegex.test(row.predictionTime)) {
-        rowMalformed = true;
-        continue;
-      }
-      
       const eventTimeNum = new Date(row.eventTime).getTime();
-      if (isNaN(eventTimeNum)) {
-        rowMalformed = true;
-        continue;
-      }
-
       const key = `${row.entity}|${eventTimeNum}`;
       if (retainedRowsMap.has(key)) {
         const existing = retainedRowsMap.get(key);
@@ -135,17 +165,11 @@ async function handleSelect(data, bodyText, env) {
         retainedRowsMap.set(key, row);
       }
     }
-    
-    if (rowMalformed && !reasonCodes.includes('INVALID_INPUT')) {
-      reasonCodes.push('INVALID_INPUT');
-    }
-    
-    const retainedRows = Array.from(retainedRowsMap.values());
-    if (retainedRows.length === 0 && !reasonCodes.includes('INVALID_INPUT')) {
-      reasonCodes.push('INVALID_INPUT');
-    }
 
-    if (!reasonCodes.includes('INVALID_INPUT')) {
+    const retainedRows = Array.from(retainedRowsMap.values());
+    
+    // Feature eligibility
+    if (retainedRows.length > 0) {
       const firstRowFeatures = Object.keys(retainedRows[0].features || {});
       const forbidden = data.forbiddenFeatures || [];
       
@@ -160,7 +184,7 @@ async function handleSelect(data, bodyText, env) {
           }
           const availDate = new Date(row.features[f].availableAt);
           const predDate = new Date(row.predictionTime);
-          if (isNaN(availDate.getTime()) || isNaN(predDate.getTime()) || availDate.getTime() > predDate.getTime()) {
+          if (availDate.getTime() > predDate.getTime()) {
             eligible = false;
             break;
           }
@@ -200,7 +224,7 @@ async function handleSelect(data, bodyText, env) {
   reasonCodes.sort(utf8Compare);
 
   const responseObj = {
-    runId: data.runId,
+    runId: data && data.runId ? data.runId : null,
     selectedTrialId: reasonCodes.length > 0 ? null : selectedTrialId,
     trainRowIds: reasonCodes.includes('INVALID_INPUT') ? [] : trainRowIds,
     evalRowIds: reasonCodes.includes('INVALID_INPUT') ? [] : evalRowIds,
@@ -209,8 +233,20 @@ async function handleSelect(data, bodyText, env) {
     reasonCodes: [...new Set(reasonCodes)]
   };
 
-  await env.STORE.put(data.runId, JSON.stringify({ request: bodyText, response: responseObj }));
-  
+  // Only store if runId was somewhat valid
+  if (data && data.runId && typeof data.runId === 'string' && data.runId.length > 0) {
+     const storedStr = await env.STORE.get(data.runId);
+     if (storedStr) {
+       const parsed = JSON.parse(storedStr);
+       if (parsed.request === bodyText) {
+         return new Response(JSON.stringify(parsed.response), { status: 200, headers: { 'content-type': 'application/json' } });
+       } else {
+         return new Response(JSON.stringify({ error: "RUN_ID_CONFLICT" }), { status: 409, headers: { 'content-type': 'application/json' } });
+       }
+     }
+     await env.STORE.put(data.runId, JSON.stringify({ request: bodyText, response: responseObj }));
+  }
+
   return new Response(JSON.stringify(responseObj), { status: 200, headers: { 'content-type': 'application/json' } });
 }
 
@@ -218,13 +254,40 @@ async function handleEvaluate(data, env) {
   let reasonCodes = [];
   let isMalformed = false;
 
-  if (!data.runId || !data.datasetDigest || typeof data.selectedTrialId !== 'number') {
+  if (!data || typeof data !== 'object') {
     isMalformed = true;
+  } else {
+    if (!data.runId || typeof data.runId !== 'string' || !data.datasetDigest || typeof data.datasetDigest !== 'string' || typeof data.selectedTrialId !== 'number' || !Number.isSafeInteger(data.selectedTrialId)) {
+      isMalformed = true;
+    }
+    if (typeof data.bytesProcessed !== 'number' || !Number.isSafeInteger(data.bytesProcessed) || data.bytesProcessed < 0) isMalformed = true;
+    if (typeof data.maxBytes !== 'number' || !Number.isSafeInteger(data.maxBytes) || data.maxBytes < 0) isMalformed = true;
+    if (typeof data.metricFloor !== 'number' || data.metricFloor < 0 || data.metricFloor > 1 || !isFinite(data.metricFloor)) isMalformed = true;
+    
+    if (data.requiredSlices !== undefined && data.requiredSlices !== null) {
+      if (typeof data.requiredSlices !== 'object') {
+        isMalformed = true;
+      } else {
+        for (const [k, v] of Object.entries(data.requiredSlices)) {
+          if (typeof v !== 'number' || v < 0 || v > 1 || !isFinite(v)) {
+            isMalformed = true;
+            break;
+          }
+        }
+      }
+    }
+  }
+
+  if (isMalformed) {
     reasonCodes.push('INVALID_INPUT');
   }
 
+  if (data && typeof data.bytesProcessed === 'number' && typeof data.maxBytes === 'number' && data.bytesProcessed > data.maxBytes) {
+    reasonCodes.push('BYTE_LIMIT');
+  }
+
   let invalidLineage = false;
-  if (!isMalformed) {
+  if (data && typeof data.runId === 'string' && typeof data.datasetDigest === 'string' && typeof data.selectedTrialId === 'number') {
     const storedStr = await env.STORE.get(data.runId);
     if (!storedStr) {
       invalidLineage = true;
@@ -235,24 +298,12 @@ async function handleEvaluate(data, env) {
         invalidLineage = true;
       }
     }
-    if (invalidLineage) {
-      reasonCodes.push('INVALID_LINEAGE');
-    }
-  }
-
-  if (typeof data.bytesProcessed !== 'number' || !Number.isSafeInteger(data.bytesProcessed) || data.bytesProcessed < 0 ||
-      typeof data.maxBytes !== 'number' || !Number.isSafeInteger(data.maxBytes) || data.maxBytes < 0) {
-    if (!reasonCodes.includes('INVALID_INPUT')) reasonCodes.push('INVALID_INPUT');
-    isMalformed = true;
   } else {
-    if (data.bytesProcessed > data.maxBytes) {
-      reasonCodes.push('BYTE_LIMIT');
-    }
+    invalidLineage = true;
   }
 
-  if (!data.rows || !Array.isArray(data.rows) || typeof data.metricFloor !== 'number' || data.metricFloor < 0 || data.metricFloor > 1) {
-    if (!reasonCodes.includes('INVALID_INPUT')) reasonCodes.push('INVALID_INPUT');
-    isMalformed = true;
+  if (invalidLineage) {
+    reasonCodes.push('INVALID_LINEAGE');
   }
 
   let hasInvalidRow = false;
@@ -261,20 +312,19 @@ async function handleEvaluate(data, env) {
   let sliceCorrect = {};
   let sliceTotal = {};
   let presentSlices = new Set();
-  
-  if (Array.isArray(data.rows)) {
+  let rowsEmpty = false;
+
+  if (!data || !Array.isArray(data.rows)) {
+    if (!reasonCodes.includes('INVALID_INPUT')) reasonCodes.push('INVALID_INPUT');
+    rowsEmpty = true;
+  } else {
+    if (data.rows.length === 0) rowsEmpty = true;
     for (const row of data.rows) {
-      if (row.label !== 0 && row.label !== 1) hasInvalidRow = true;
-      if (row.prediction !== 0 && row.prediction !== 1) hasInvalidRow = true;
-      if (typeof row.slice !== 'string' || row.slice === '') hasInvalidRow = true;
-      
-      if (hasInvalidRow) {
-        if (!reasonCodes.includes('INVALID_TEST_ROW')) {
-          reasonCodes.push('INVALID_TEST_ROW'); 
-        }
-        break; 
-      }
-      
+      if (!row || typeof row !== 'object') { hasInvalidRow = true; break; }
+      if (row.label !== 0 && row.label !== 1) { hasInvalidRow = true; break; }
+      if (row.prediction !== 0 && row.prediction !== 1) { hasInvalidRow = true; break; }
+      if (typeof row.slice !== 'string' || row.slice === '') { hasInvalidRow = true; break; }
+
       rowCount++;
       if (row.label === row.prediction) correctCount++;
       
@@ -284,26 +334,24 @@ async function handleEvaluate(data, env) {
         sliceCorrect[row.slice] = (sliceCorrect[row.slice] || 0) + 1;
       }
     }
-  } else {
-    hasInvalidRow = true;
+  }
+
+  if (hasInvalidRow) {
+    reasonCodes.push('INVALID_TEST_ROW');
   }
 
   let testMetric = null;
   let criticalSlicePass = true;
-  let rowsEmpty = Array.isArray(data.rows) && data.rows.length === 0;
 
-  if (isMalformed || invalidLineage) {
-    criticalSlicePass = false;
-  }
-  if (hasInvalidRow) {
+  if (isMalformed || invalidLineage || hasInvalidRow) {
     criticalSlicePass = false;
   }
 
-  if (hasInvalidRow || rowsEmpty || isMalformed) {
+  if (hasInvalidRow || rowsEmpty || isMalformed || reasonCodes.includes('INVALID_INPUT')) {
     testMetric = null;
   } else {
     testMetric = correctCount / rowCount;
-    testMetric = Math.round(testMetric * 1e12) / 1e12;
+    testMetric = Number(testMetric.toFixed(12));
     
     if (testMetric < data.metricFloor) {
       reasonCodes.push('AGGREGATE_FLOOR');
@@ -316,7 +364,7 @@ async function handleEvaluate(data, env) {
           criticalSlicePass = false;
         } else {
           let sliceAcc = sliceCorrect[sliceName] / sliceTotal[sliceName];
-          sliceAcc = Math.round(sliceAcc * 1e12) / 1e12;
+          sliceAcc = Number(sliceAcc.toFixed(12));
           if (sliceAcc < floor) {
             reasonCodes.push(`SLICE_FLOOR:${sliceName}`);
             criticalSlicePass = false;
@@ -335,15 +383,16 @@ async function handleEvaluate(data, env) {
   reasonCodes.sort(utf8Compare);
 
   const responseObj = {
-    runId: data.runId,
-    selectedTrialId: data.selectedTrialId,
-    datasetDigest: data.datasetDigest,
+    runId: data && data.runId ? data.runId : null,
+    selectedTrialId: data && typeof data.selectedTrialId === 'number' ? data.selectedTrialId : null,
+    datasetDigest: data && typeof data.datasetDigest === 'string' ? data.datasetDigest : null,
     testMetric: testMetric,
     criticalSlicePass: criticalSlicePass,
     decision: decision,
-    bytesProcessed: data.bytesProcessed,
+    bytesProcessed: data && typeof data.bytesProcessed === 'number' ? data.bytesProcessed : null,
     reasonCodes: reasonCodes
   };
 
   return new Response(JSON.stringify(responseObj), { status: 200, headers: { 'content-type': 'application/json' } });
 }
+
