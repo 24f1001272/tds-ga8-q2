@@ -1,0 +1,9 @@
+name = "bqml-experiment-gate"
+main = "src/index.js"
+compatibility_date = "2023-10-30"
+
+# We will use KV (Key-Value) to store data between phase 1 and phase 2.
+# You will need to create a KV namespace in your Cloudflare Dashboard and replace 'YOUR_KV_NAMESPACE_ID' below!
+[[kv_namespaces]]
+binding = "STORE"
+id = "YOUR_KV_NAMESPACE_ID"
