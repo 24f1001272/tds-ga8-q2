@@ -6,4 +6,4 @@ compatibility_date = "2023-10-30"
 # You will need to create a KV namespace in your Cloudflare Dashboard and replace 'YOUR_KV_NAMESPACE_ID' below!
 [[kv_namespaces]]
 binding = "STORE"
-id = "YOUR_KV_NAMESPACE_ID"
+id = "8d541f1ab59b4cd19b0169cc746b7a76"
